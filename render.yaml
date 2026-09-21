@@ -1,7 +1,7 @@
 services:
   - type: web
     name: n8n-trading-project
-    runtime: docker
+    runtime: image
     image:
       url: docker.io/n8nio/n8n:latest
     plan: free
