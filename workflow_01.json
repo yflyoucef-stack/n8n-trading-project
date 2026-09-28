@@ -1,0 +1,474 @@
+{
+  "name": "01_Paper_Trading_Engine",
+  "nodes": [
+    {
+      "id": "6044c70e-5c29-4e26-9e38-2ab1b463ed5f",
+      "name": "Hourly Check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        192
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5c6636da-451d-46d3-8267-e5e5c2ebd2ac",
+      "name": "Get Paper State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        224,
+        192
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT id, equity::float8 AS equity, peakequity::float8 AS \"peakEquity\", inposition AS \"inPosition\", symbol, entryprice::float8 AS \"entryPrice\", stopprice::float8 AS \"stopPrice\", firsttarget::float8 AS \"firstTarget\", notionalfull::float8 AS \"notionalFull\", notionalremaining::float8 AS \"notionalRemaining\", halfclosed AS \"halfClosed\", trailstop::float8 AS \"trailStop\", highestsinceentry::float8 AS \"highestSinceEntry\", barsopen AS \"barsOpen\", tradinglocked AS \"tradingLocked\" FROM paper_state ORDER BY id LIMIT 1",
+        "options": {}
+      }
+    },
+    {
+      "id": "8295b27e-180a-4eb8-9531-7977ba01d9de",
+      "name": "Parse State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        192
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\ndelete staticData.candidateSignal;\nconst row = $input.first().json;\nreturn [{ json: {\n  id: row.id,\n  equity: row.equity,\n  peakEquity: row.peakEquity,\n  inPosition: !!row.inPosition,\n  symbol: row.symbol,\n  entryPrice: row.entryPrice,\n  stopPrice: row.stopPrice,\n  firstTarget: row.firstTarget,\n  notionalFull: row.notionalFull,\n  notionalRemaining: row.notionalRemaining,\n  halfClosed: !!row.halfClosed,\n  trailStop: row.trailStop,\n  highestSinceEntry: row.highestSinceEntry,\n  barsOpen: row.barsOpen,\n  tradingLocked: !!row.tradingLocked\n} }];"
+      }
+    },
+    {
+      "id": "79659605-674d-4c56-9aa4-1fd69af4414a",
+      "name": "Has Position?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        672,
+        192
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.inPosition }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "1becca52-d7a0-4819-b5cc-71eb53fc9492",
+      "name": "Get Klines For Open Symbol",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        896,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://open-api.bingx.com/openApi/spot/v2/market/kline",
+        "authentication": "none",
+        "sendQuery": true,
+        "specifyQuery": "keypair",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{ $('Parse State').item.json.symbol }}"
+            },
+            {
+              "name": "interval",
+              "value": "1h"
+            },
+            {
+              "name": "limit",
+              "value": "250"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "1be6579a-7581-42ec-8bf5-a4d4994b42b8",
+      "name": "Manage Exit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const state = $('Parse State').item.json;\nconst resp = $input.first().json;\nconst rows = resp.data || resp;\nconst parsed = rows.map(function(r){ const a = Array.isArray(r) ? r : Object.values(r); return { t:Number(a[0]), o:Number(a[1]), h:Number(a[2]), l:Number(a[3]), c:Number(a[4]), v:Number(a[5]) }; });\nparsed.sort(function(a,b){ return a.t-b.t; });\nfunction ema(values, period){ const k=2/(period+1); const out=[]; for (let i=0;i<values.length;i++){ out.push(i===0?values[i]:(values[i]*k+out[i-1]*(1-k))); } return out; }\nfunction atrCalc(highs, lows, closes, period){ const trs=[]; for (let i=0;i<closes.length;i++){ if(i===0){trs.push(highs[i]-lows[i]); continue;} trs.push(Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1]))); } const k=1/period; const out=[]; for (let i=0;i<trs.length;i++){ out.push(i===0?trs[i]:(trs[i]*k+out[i-1]*(1-k))); } return out; }\nconst closes = parsed.map(function(p){return p.c;});\nconst highs = parsed.map(function(p){return p.h;});\nconst lows = parsed.map(function(p){return p.l;});\nconst ema50 = ema(closes,50);\nconst ema200 = ema(closes,200);\nconst atr14 = atrCalc(highs,lows,closes,14);\nconst n = parsed.length;\nconst last = parsed[n-1];\nconst curAtr = atr14[n-1];\nconst deathCross = (ema50[n-2] >= ema200[n-2]) && (ema50[n-1] < ema200[n-1]);\nconst FEE_RATE = 0.001;\nconst TRAIL_ATR_MULT = 2.0;\nconst MAX_HOLD_BARS = 240;\nlet action = 'NONE';\nlet exitPrice = null;\nlet reason = null;\nconst su = Object.assign({}, state);\nsu.barsOpen = (state.barsOpen||0) + 1;\nsu.highestSinceEntry = Math.max(state.highestSinceEntry||state.entryPrice, last.h);\nlet trade = { closedAt: '', symbol: '', reason: '', entryPrice: 0, exitPrice: 0, notional: 0, grossPnl: 0, fees: 0, netPnl: 0, equityAfter: 0 };\nlet tradeHappened = false;\nif (!state.halfClosed) {\n  if (last.l <= state.stopPrice) { exitPrice = state.stopPrice; reason='STOP_FULL'; action='FULL_EXIT'; }\n  else if (last.h >= state.firstTarget) {\n    const half = state.notionalRemaining/2;\n    const gross = (state.firstTarget-state.entryPrice)/state.entryPrice*half;\n    const fees = half*FEE_RATE*2;\n    const net = gross-fees;\n    const newEquity = state.equity+net;\n    su.equity = newEquity; su.peakEquity = Math.max(state.peakEquity, newEquity);\n    su.notionalRemaining = half; su.halfClosed = true; su.stopPrice = state.entryPrice; su.trailStop = state.entryPrice;\n    action='PARTIAL_EXIT'; reason='PARTIAL_TARGET'; exitPrice = state.firstTarget;\n    trade = { closedAt: new Date().toISOString(), symbol: state.symbol, reason: reason, entryPrice: state.entryPrice, exitPrice: exitPrice, notional: half, grossPnl: gross, fees: fees, netPnl: net, equityAfter: newEquity }; tradeHappened = true;\n  }\n} else {\n  const newTrail = last.h - TRAIL_ATR_MULT*curAtr;\n  su.trailStop = Math.max(state.trailStop, state.stopPrice, newTrail);\n  if (last.l <= su.trailStop) { exitPrice = su.trailStop; reason='TRAIL_STOP'; action='FULL_EXIT'; }\n  else if (deathCross) { exitPrice = last.c; reason='TREND_INVALIDATION'; action='FULL_EXIT'; }\n  else if (su.barsOpen >= MAX_HOLD_BARS) { exitPrice = last.c; reason='MAX_HOLD'; action='FULL_EXIT'; }\n}\nif (action === 'FULL_EXIT') {\n  const notional = state.notionalRemaining;\n  const gross = (exitPrice-state.entryPrice)/state.entryPrice*notional;\n  const fees = notional*FEE_RATE*2;\n  const net = gross-fees;\n  const newEquity = state.equity+net;\n  su.equity = newEquity; su.peakEquity = Math.max(state.peakEquity, newEquity);\n  trade = { closedAt: new Date().toISOString(), symbol: state.symbol, reason: reason, entryPrice: state.entryPrice, exitPrice: exitPrice, notional: notional, grossPnl: gross, fees: fees, netPnl: net, equityAfter: newEquity }; tradeHappened = true;\n  su.inPosition = false; su.symbol=''; su.entryPrice=0; su.stopPrice=0; su.firstTarget=0; su.notionalFull=0; su.notionalRemaining=0; su.halfClosed=false; su.trailStop=0; su.highestSinceEntry=0; su.barsOpen=0;\n}\nsu.lastUpdated = new Date().toISOString();\nreturn [{ json: { id: state.id, equity: su.equity, peakEquity: su.peakEquity, inPosition: su.inPosition, symbol: su.symbol, entryPrice: su.entryPrice, stopPrice: su.stopPrice, firstTarget: su.firstTarget, notionalFull: su.notionalFull, notionalRemaining: su.notionalRemaining, halfClosed: su.halfClosed, trailStop: su.trailStop, highestSinceEntry: su.highestSinceEntry, barsOpen: su.barsOpen, tradingLocked: state.tradingLocked, lastUpdated: su.lastUpdated, tradeOccurred: tradeHappened, trade: trade } }];"
+      }
+    },
+    {
+      "id": "993c6784-20b7-4c89-94d2-d47400bba32c",
+      "name": "Update Paper State (Exit)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1344,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE paper_state SET equity = {{ $json.equity }}, peakequity = {{ $json.peakEquity }}, inposition = {{ $json.inPosition }}, symbol = '{{ $json.symbol }}', entryprice = {{ $json.entryPrice }}, stopprice = {{ $json.stopPrice }}, firsttarget = {{ $json.firstTarget }}, notionalfull = {{ $json.notionalFull }}, notionalremaining = {{ $json.notionalRemaining }}, halfclosed = {{ $json.halfClosed }}, trailstop = {{ $json.trailStop }}, highestsinceentry = {{ $json.highestSinceEntry }}, barsopen = {{ $json.barsOpen }}, tradinglocked = {{ $json.tradingLocked }}, lastupdated = '{{ $json.lastUpdated }}' WHERE id = {{ $json.id }} RETURNING id",
+        "options": {}
+      }
+    },
+    {
+      "id": "0c2567f3-a084-44fe-8e7a-9b5f33ac39fa",
+      "name": "Trade Occurred?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1568,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Manage Exit').item.json.tradeOccurred }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "142179a9-ec0b-4107-8b94-4cc5851d1aae",
+      "name": "Insert Paper Trade",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1792,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO paper_trades (closedat, symbol, reason, entryprice, exitprice, notional, grosspnl, fees, netpnl, equityafter) VALUES ('{{ $('Manage Exit').item.json.trade.closedAt }}', '{{ $('Manage Exit').item.json.trade.symbol }}', '{{ $('Manage Exit').item.json.trade.reason }}', {{ $('Manage Exit').item.json.trade.entryPrice }}, {{ $('Manage Exit').item.json.trade.exitPrice }}, {{ $('Manage Exit').item.json.trade.notional }}, {{ $('Manage Exit').item.json.trade.grossPnl }}, {{ $('Manage Exit').item.json.trade.fees }}, {{ $('Manage Exit').item.json.trade.netPnl }}, {{ $('Manage Exit').item.json.trade.equityAfter }}) RETURNING id",
+        "options": {}
+      }
+    },
+    {
+      "id": "897e7da3-0d63-4762-8406-25d7989c19a3",
+      "name": "Get Approved Symbols",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        896,
+        384
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT id, symbol FROM shariah_assets WHERE approved = true",
+        "options": {}
+      }
+    },
+    {
+      "id": "c7801e04-775f-4824-9ee1-92bf3e00b1a1",
+      "name": "Finalize Entry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        192
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst cand = staticData.candidateSignal;\nif (!cand) { return []; }\nconst state = $('Parse State').item.json;\nconst MIN_STOP_PCT = 0.03;\nconst RISK_PER_TRADE = 0.02;\nconst entry = cand.entryPrice;\nconst stop = entry - Math.max(1.5*cand.atr, MIN_STOP_PCT*entry);\nconst firstTarget = entry + 1.0*(entry-stop);\nconst riskAmount = state.equity * RISK_PER_TRADE;\nconst stopDistPct = (entry-stop)/entry;\nconst notional = Math.min(riskAmount/stopDistPct, state.equity*0.95);\ndelete staticData.candidateSignal;\nreturn [{ json: { id: state.id, equity: state.equity, peakEquity: state.peakEquity, inPosition: true, symbol: cand.symbol, entryPrice: entry, stopPrice: stop, firstTarget: firstTarget, notionalFull: notional, notionalRemaining: notional, halfClosed: false, trailStop: 0, highestSinceEntry: entry, barsOpen: 0, tradingLocked: state.tradingLocked, lastUpdated: new Date().toISOString() } }];"
+      }
+    },
+    {
+      "id": "cb3257af-91aa-4574-b39c-fb5de3f79db7",
+      "name": "Update Paper State (Entry)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1568,
+        192
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE paper_state SET equity = {{ $json.equity }}, peakequity = {{ $json.peakEquity }}, inposition = {{ $json.inPosition }}, symbol = '{{ $json.symbol }}', entryprice = {{ $json.entryPrice }}, stopprice = {{ $json.stopPrice }}, firsttarget = {{ $json.firstTarget }}, notionalfull = {{ $json.notionalFull }}, notionalremaining = {{ $json.notionalRemaining }}, halfclosed = {{ $json.halfClosed }}, trailstop = {{ $json.trailStop }}, highestsinceentry = {{ $json.highestSinceEntry }}, barsopen = {{ $json.barsOpen }}, tradinglocked = {{ $json.tradingLocked }}, lastupdated = '{{ $json.lastUpdated }}' WHERE id = {{ $json.id }} RETURNING id",
+        "options": {}
+      }
+    },
+    {
+      "id": "6c8825b9-13fe-4cd8-b310-128426f9e705",
+      "name": "Get Klines For Candidate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1344,
+        384
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://open-api.bingx.com/openApi/spot/v2/market/kline",
+        "authentication": "none",
+        "sendQuery": true,
+        "specifyQuery": "keypair",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{ $('Symbol Scan Loop').item.json.symbol }}"
+            },
+            {
+              "name": "interval",
+              "value": "1h"
+            },
+            {
+              "name": "limit",
+              "value": "250"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d042c94d-7d5f-41f2-8e89-c24c4c599fa8",
+      "name": "Check Entry Candidate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        464
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const symbol = $('Symbol Scan Loop').item.json.symbol;\nconst resp = $input.first().json;\nconst rows = resp.data || resp;\nif (!rows || rows.length < 210) { return [{ json: { symbol: symbol, signal: false, skipped: true } }]; }\nconst parsed = rows.map(function(r){ const a = Array.isArray(r) ? r : Object.values(r); return { t:Number(a[0]), o:Number(a[1]), h:Number(a[2]), l:Number(a[3]), c:Number(a[4]), v:Number(a[5]) }; });\nparsed.sort(function(a,b){ return a.t-b.t; });\nfunction ema(values, period){ const k=2/(period+1); const out=[]; for (let i=0;i<values.length;i++){ out.push(i===0?values[i]:(values[i]*k+out[i-1]*(1-k))); } return out; }\nfunction atrCalc(highs, lows, closes, period){ const trs=[]; for (let i=0;i<closes.length;i++){ if(i===0){trs.push(highs[i]-lows[i]); continue;} trs.push(Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1]))); } const k=1/period; const out=[]; for (let i=0;i<trs.length;i++){ out.push(i===0?trs[i]:(trs[i]*k+out[i-1]*(1-k))); } return out; }\nfunction rsiCalc(closes, period){ const out=[]; let avgGain=0, avgLoss=0; for (let i=0;i<closes.length;i++){ if(i===0){out.push(50); continue;} const diff=closes[i]-closes[i-1]; const gain=diff>0?diff:0; const loss=diff<0?-diff:0; if(i===1){avgGain=gain; avgLoss=loss;} else {avgGain=(avgGain*(period-1)+gain)/period; avgLoss=(avgLoss*(period-1)+loss)/period;} const rs = avgLoss===0?100:avgGain/avgLoss; out.push(avgLoss===0?100:100-100/(1+rs)); } return out; }\nconst closes = parsed.map(function(p){return p.c;});\nconst highs = parsed.map(function(p){return p.h;});\nconst lows = parsed.map(function(p){return p.l;});\nconst vols = parsed.map(function(p){return p.v;});\nconst ema50 = ema(closes,50);\nconst ema200 = ema(closes,200);\nconst atr14 = atrCalc(highs,lows,closes,14);\nconst rsi14 = rsiCalc(closes,14);\nconst n = parsed.length;\nconst i = n-1;\nlet volSum = 0;\nfor (let j=Math.max(0,i-19); j<=i; j++){ volSum += vols[j]; }\nconst volAvg20 = volSum/20;\nconst uptrend = ema50[i] > ema200[i];\nconst prevRsi = rsi14[i-1];\nconst rsiCrossUp = prevRsi < 40 && rsi14[i] >= 40;\nlet hadPullback = false;\nfor (let j=Math.max(0,i-5); j<i; j++){ if (rsi14[j] < 40){ hadPullback = true; } }\nconst volOk = volAvg20 > 0 && (vols[i]/volAvg20) >= 1.2;\nconst volaOk = (atr14[i]/closes[i]) <= 0.05;\nconst signal = uptrend && rsiCrossUp && hadPullback && volOk && volaOk;\nconst staticData = $getWorkflowStaticData('global');\nif (signal && !staticData.candidateSignal) { staticData.candidateSignal = { symbol: symbol, entryPrice: closes[i], atr: atr14[i] }; }\nreturn [{ json: { symbol: symbol, signal: signal } }];"
+      }
+    },
+    {
+      "id": "13801ba7-e361-4d60-8e4e-0ef27966b848",
+      "name": "Symbol Scan Loop",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1120,
+        384
+      ],
+      "parameters": {
+        "batchSize": 1
+      }
+    },
+    {
+      "id": "b85e6678-9e5a-4319-b08f-b84ce680bdef",
+      "name": "Sticky Note 73dfc0af",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        832,
+        464
+      ],
+      "parameters": {
+        "content": "## Paper Trading Engine (refined hybrid strategy)\nRuns hourly. If a position is open, manages exit (stop / partial target / trailing stop / trend invalidation / max hold). If flat, scans approved symbols for a Section 7A pullback entry. All state lives in the paper_state and paper_trades Data Tables - no real BingX credentials are used anywhere in this workflow."
+      }
+    }
+  ],
+  "connections": {
+    "Hourly Check": {
+      "main": [
+        [
+          {
+            "node": "Get Paper State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Paper State": {
+      "main": [
+        [
+          {
+            "node": "Parse State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse State": {
+      "main": [
+        [
+          {
+            "node": "Has Position?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Position?": {
+      "main": [
+        [
+          {
+            "node": "Get Klines For Open Symbol",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Approved Symbols",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Klines For Open Symbol": {
+      "main": [
+        [
+          {
+            "node": "Manage Exit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manage Exit": {
+      "main": [
+        [
+          {
+            "node": "Update Paper State (Exit)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Paper State (Exit)": {
+      "main": [
+        [
+          {
+            "node": "Trade Occurred?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trade Occurred?": {
+      "main": [
+        [
+          {
+            "node": "Insert Paper Trade",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Approved Symbols": {
+      "main": [
+        [
+          {
+            "node": "Symbol Scan Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Entry": {
+      "main": [
+        [
+          {
+            "node": "Update Paper State (Entry)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Klines For Candidate": {
+      "main": [
+        [
+          {
+            "node": "Check Entry Candidate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Entry Candidate": {
+      "main": [
+        [
+          {
+            "node": "Symbol Scan Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Symbol Scan Loop": {
+      "main": [
+        [
+          {
+            "node": "Finalize Entry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Klines For Candidate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
